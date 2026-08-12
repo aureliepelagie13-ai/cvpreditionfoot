@@ -26,7 +26,7 @@ function premiumAuth(req){
   return true;
 }
 function safeUser(){ return process.env.ADMIN_USER || "admin"; }
-function safePass(){ return process.env.ADMIN_PASSWORD || "change-me"; }
+function safePass(){ return process.env.ADMIN_PASSWORD || "PFci-500-2026!"; }
 function baseUrl(req){ return (process.env.PUBLIC_URL || `${req.protocol}://${req.get("host")}`).replace(/\/$/,""); }
 
 app.use(express.json());
@@ -45,9 +45,7 @@ app.post("/api/login",(req,res)=>{
 app.get("/api/predictions",(req,res)=>{
   const s=readStore();
   const published=s.predictions.filter(p=>p.published);
-  if(!premiumAuth(req)){
-    return res.json(published.map(p=>({id:p.id,match:p.match,league:p.league,date:p.date,time:p.time,locked:true})));
-  }
+  if(!premiumAuth(req)) return res.json(published.map(p=>({id:p.id,match:p.match,league:p.league,date:p.date,time:p.time,locked:true})));
   res.json(published);
 });
 
@@ -67,18 +65,12 @@ app.delete("/api/predictions/:id",adminAuth,(req,res)=>{
 
 app.post("/api/create-payment",async(req,res)=>{
   const price=Number(process.env.PRICE_XOF||500);
-  if(!process.env.WAVE_API_KEY){
-    return res.status(503).json({error:"Wave n'est pas encore configuré.",setup:"Ajoutez WAVE_API_KEY côté serveur après avoir activé votre compte Wave Business."});
-  }
+  if(!process.env.WAVE_API_KEY) return res.status(503).json({error:"Wave n'est pas encore configuré.",setup:"Ajoutez WAVE_API_KEY côté serveur après avoir activé votre compte Wave Business."});
   const reference=`PF-${Date.now()}-${crypto.randomBytes(4).toString("hex")}`;
   const successUrl=`${baseUrl(req)}/success.html?ref=${encodeURIComponent(reference)}`;
   const errorUrl=`${baseUrl(req)}/index.html?payment=error`;
   try{
-    const response=await fetch("https://api.wave.com/v1/checkout/sessions",{
-      method:"POST",
-      headers:{"Authorization":`Bearer ${process.env.WAVE_API_KEY}`,"Content-Type":"application/json"},
-      body:JSON.stringify({amount:String(price),currency:"XOF",client_reference:reference,error_url:errorUrl,success_url:successUrl})
-    });
+    const response=await fetch("https://api.wave.com/v1/checkout/sessions",{method:"POST",headers:{"Authorization":`Bearer ${process.env.WAVE_API_KEY}`,"Content-Type":"application/json"},body:JSON.stringify({amount:String(price),currency:"XOF",client_reference:reference,error_url:errorUrl,success_url:successUrl})});
     const data=await response.json();
     if(!response.ok) return res.status(response.status).json(data);
     res.json({url:data.wave_launch_url,reference});
