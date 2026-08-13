@@ -1,99 +1,184 @@
 import express from "express";
-import fs from "fs";
-import path from "path";
 import crypto from "crypto";
+import path from "path";
 import { fileURLToPath } from "url";
+import { neon } from "@neondatabase/serverless";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const app = express();
 const PORT = process.env.PORT || 3000;
-const STORE = path.join(__dirname, "data", "store.json");
 const sessions = new Map();
-const premiumSessions = new Map();
 
-function readStore(){ return JSON.parse(fs.readFileSync(STORE,"utf8")); }
-function writeStore(s){ fs.writeFileSync(STORE, JSON.stringify(s,null,2)); }
-function adminAuth(req,res,next){
-  const token=req.headers.authorization?.replace("Bearer ","");
-  if(token && sessions.has(token)) return next();
-  res.status(401).json({error:"Non autorisé"});
+const DATABASE_URL =
+  process.env.DATABASE_URL ||
+  process.env.POSTGRES_URL ||
+  process.env.POSTGRES_URL_NON_POOLING ||
+  process.env.POSTGRES_PRISMA_URL;
+
+const sql = DATABASE_URL ? neon(DATABASE_URL) : null;
+
+async function dbReady() {
+  if (!sql) throw new Error("Base Neon/Postgres non configurée.");
+  await sql`
+    CREATE TABLE IF NOT EXISTS predictions (
+      id TEXT PRIMARY KEY,
+      match TEXT NOT NULL,
+      league TEXT NOT NULL DEFAULT '',
+      date TEXT NOT NULL DEFAULT '',
+      time TEXT NOT NULL DEFAULT '',
+      pick TEXT NOT NULL,
+      odds TEXT NOT NULL DEFAULT '',
+      analysis TEXT NOT NULL DEFAULT '',
+      published BOOLEAN NOT NULL DEFAULT TRUE,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    )
+  `;
 }
-function premiumAuth(req){
-  const token=req.headers.authorization?.replace("Bearer ","");
-  const item=token && premiumSessions.get(token);
-  if(!item) return false;
-  if(item.expiresAt < Date.now()){ premiumSessions.delete(token); return false; }
-  return true;
+
+function auth(req, res, next) {
+  const token = req.headers.authorization?.replace("Bearer ", "");
+  if (token && sessions.has(token)) return next();
+  res.status(401).json({ error: "Non autorisé" });
 }
-function safeUser(){ return process.env.ADMIN_USER || "admin"; }
-function safePass(){ return process.env.ADMIN_PASSWORD || "PFci-500-2026!"; }
-function baseUrl(req){ return (process.env.PUBLIC_URL || `${req.protocol}://${req.get("host")}`).replace(/\/$/,""); }
+
+function safeUser() {
+  return process.env.ADMIN_USER || "admin";
+}
+
+function safePass() {
+  return process.env.ADMIN_PASSWORD || "change-me";
+}
+
+function mapPrediction(row) {
+  return {
+    id: row.id,
+    match: row.match,
+    league: row.league,
+    date: row.date,
+    time: row.time,
+    pick: row.pick,
+    odds: row.odds,
+    analysis: row.analysis,
+    published: row.published,
+    createdAt: row.created_at
+  };
+}
 
 app.use(express.json());
-app.use(express.static(path.join(__dirname,"public")));
+app.use(express.static(path.join(__dirname, "public")));
 
-app.post("/api/login",(req,res)=>{
-  const {username,password}=req.body;
-  if(username===safeUser() && password===safePass()){
-    const token=crypto.randomBytes(32).toString("hex");
-    sessions.set(token,{created:Date.now()});
-    return res.json({token});
+app.post("/api/login", (req, res) => {
+  const { username, password } = req.body || {};
+  if (username === safeUser() && password === safePass()) {
+    const token = crypto.randomBytes(32).toString("hex");
+    sessions.set(token, { created: Date.now() });
+    return res.json({ token });
   }
-  res.status(401).json({error:"Identifiants incorrects"});
+  res.status(401).json({ error: "Identifiants incorrects" });
 });
 
-app.get("/api/predictions",(req,res)=>{
-  const s=readStore();
-  const published=s.predictions.filter(p=>p.published);
-  if(!premiumAuth(req)) return res.json(published.map(p=>({id:p.id,match:p.match,league:p.league,date:p.date,time:p.time,locked:true})));
-  res.json(published);
+app.get("/api/predictions", async (req, res) => {
+  try {
+    await dbReady();
+    const rows = await sql`
+      SELECT id, match, league, date, time, pick, odds, analysis, published, created_at
+      FROM predictions
+      WHERE published = TRUE
+      ORDER BY created_at DESC
+    `;
+    res.json(rows.map(mapPrediction));
+  } catch (e) {
+    console.error("GET /api/predictions:", e);
+    res.status(500).json({ error: "Impossible de charger les pronostics." });
+  }
 });
 
-app.post("/api/predictions",adminAuth,(req,res)=>{
-  const {match,league,date,time,pick,odds,analysis}=req.body;
-  if(!match || !pick) return res.status(400).json({error:"Match et pronostic obligatoires"});
-  const s=readStore();
-  const item={id:crypto.randomUUID(),match,league:league||"",date:date||"",time:time||"",pick,odds:odds||"",analysis:analysis||"",published:true,createdAt:new Date().toISOString()};
-  s.predictions.unshift(item); writeStore(s); res.json(item);
+app.post("/api/predictions", auth, async (req, res) => {
+  const { match, league, date, time, pick, odds, analysis } = req.body || {};
+  if (!match || !pick) {
+    return res.status(400).json({ error: "Match et pronostic obligatoires" });
+  }
+
+  try {
+    await dbReady();
+    const id = crypto.randomUUID();
+
+    const rows = await sql`
+      INSERT INTO predictions
+        (id, match, league, date, time, pick, odds, analysis, published)
+      VALUES
+        (${id}, ${match}, ${league || ""}, ${date || ""}, ${time || ""},
+         ${pick}, ${odds || ""}, ${analysis || ""}, TRUE)
+      RETURNING id, match, league, date, time, pick, odds, analysis, published, created_at
+    `;
+
+    res.json(mapPrediction(rows[0]));
+  } catch (e) {
+    console.error("POST /api/predictions:", e);
+    res.status(500).json({ error: "Impossible d'enregistrer le pronostic." });
+  }
 });
 
-app.delete("/api/predictions/:id",adminAuth,(req,res)=>{
-  const s=readStore();
-  s.predictions=s.predictions.filter(p=>p.id!==req.params.id);
-  writeStore(s); res.json({ok:true});
+app.delete("/api/predictions/:id", auth, async (req, res) => {
+  try {
+    await dbReady();
+    await sql`DELETE FROM predictions WHERE id = ${req.params.id}`;
+    res.json({ ok: true });
+  } catch (e) {
+    console.error("DELETE /api/predictions:", e);
+    res.status(500).json({ error: "Impossible de supprimer le pronostic." });
+  }
 });
 
-app.post("/api/create-payment",async(req,res)=>{
-  const price=Number(process.env.PRICE_XOF||500);
-  if(!process.env.WAVE_API_KEY) return res.status(503).json({error:"Wave n'est pas encore configuré.",setup:"Ajoutez WAVE_API_KEY côté serveur après avoir activé votre compte Wave Business."});
-  const reference=`PF-${Date.now()}-${crypto.randomBytes(4).toString("hex")}`;
-  const successUrl=`${baseUrl(req)}/success.html?ref=${encodeURIComponent(reference)}`;
-  const errorUrl=`${baseUrl(req)}/index.html?payment=error`;
-  try{
-    const response=await fetch("https://api.wave.com/v1/checkout/sessions",{method:"POST",headers:{"Authorization":`Bearer ${process.env.WAVE_API_KEY}`,"Content-Type":"application/json"},body:JSON.stringify({amount:String(price),currency:"XOF",client_reference:reference,error_url:errorUrl,success_url:successUrl})});
-    const data=await response.json();
-    if(!response.ok) return res.status(response.status).json(data);
-    res.json({url:data.wave_launch_url,reference});
-  }catch(e){res.status(500).json({error:"Erreur de connexion à Wave"});}
+app.post("/api/create-payment", async (req, res) => {
+  const price = Number(process.env.PRICE_XOF || 500);
+
+  if (!process.env.WAVE_API_KEY) {
+    return res.status(503).json({
+      error: "Wave n'est pas encore configuré.",
+      setup: "Ajoutez WAVE_API_KEY dans les variables d'environnement du serveur."
+    });
+  }
+
+  try {
+    const response = await fetch("https://api.wave.com/v1/checkout/sessions", {
+      method: "POST",
+      headers: {
+        "Authorization": `Bearer ${process.env.WAVE_API_KEY}`,
+        "Content-Type": "application/json"
+      },
+      body: JSON.stringify({
+        amount: String(price),
+        currency: "XOF",
+        error_url: process.env.WAVE_ERROR_URL,
+        success_url: process.env.WAVE_SUCCESS_URL
+      })
+    });
+
+    const data = await response.json();
+    if (!response.ok) return res.status(response.status).json(data);
+
+    res.json({
+      url: data.wave_launch_url || data.checkout_url || data.url,
+      session: data
+    });
+  } catch (e) {
+    console.error("POST /api/create-payment:", e);
+    res.status(500).json({ error: "Erreur de connexion à Wave" });
+  }
 });
 
-app.get("/api/verify-payment",async(req,res)=>{
-  const reference=String(req.query.ref||"");
-  const expected=Number(process.env.PRICE_XOF||500);
-  if(!reference || !process.env.WAVE_API_KEY) return res.status(400).json({paid:false,error:"Référence ou configuration manquante"});
-  try{
-    const response=await fetch(`https://api.wave.com/v1/checkout/sessions/search?client_reference=${encodeURIComponent(reference)}`,{headers:{Authorization:`Bearer ${process.env.WAVE_API_KEY}`}});
-    const data=await response.json();
-    if(!response.ok) return res.status(response.status).json({paid:false,error:"Impossible de vérifier le paiement"});
-    const session=(data.result||[]).find(x=>x.client_reference===reference);
-    const paid=Boolean(session && session.payment_status==="succeeded" && session.checkout_status==="complete" && Number(session.amount)===expected && session.currency==="XOF");
-    if(!paid) return res.json({paid:false});
-    const token=crypto.randomBytes(32).toString("hex");
-    premiumSessions.set(token,{expiresAt:Date.now()+24*60*60*1000,reference});
-    res.json({paid:true,token,expiresAt:Date.now()+24*60*60*1000});
-  }catch(e){res.status(500).json({paid:false,error:"Erreur de vérification Wave"});}
+app.get("/api/config", (req, res) => {
+  res.json({
+    siteName: process.env.SITE_NAME || "FootPredict CI",
+    price: Number(process.env.PRICE_XOF || 500)
+  });
 });
 
-app.get("/api/config",(req,res)=>res.json({siteName:process.env.SITE_NAME||"FootPredict CI",price:Number(process.env.PRICE_XOF||500)}));
-app.get("/admin",(req,res)=>res.sendFile(path.join(__dirname,"public","admin.html")));
-app.listen(PORT,()=>console.log(`FootPredict CI: http://localhost:${PORT}`));
+app.get("/admin", (req, res) =>
+  res.sendFile(path.join(__dirname, "public", "admin.html"))
+);
+
+app.listen(PORT, () => {
+  console.log(`FootPredict CI: http://localhost:${PORT}`);
+});

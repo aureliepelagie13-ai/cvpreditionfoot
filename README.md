@@ -23,4 +23,4 @@ La documentation officielle: https://docs.wave.com/checkout
 Le paiement de 500 XOF est paramétré par défaut. Après configuration Wave, le bouton de paiement redirige vers la session Checkout.
 
 ## Important
-La version fournie est une base fonctionnelle de production à déployer sur un hébergeur Node.js. Pour une vraie mise en ligne, utilisez HTTPS, une vraie base de données, un domaine, et configurez le webhook Wave pour confirmer les paiements côté serveur avant d'accorder l'accès premium.
+La version utilise Neon/Postgres pour les pronostics et ne tente plus d'écrire dans un fichier local, ce qui est compatible avec le système de fichiers en lecture seule de Vercel. Les variables de connexion Postgres doivent être fournies par l'intégration Neon/Vercel. Pour la production, utilisez HTTPS, un domaine et configurez le webhook Wave pour confirmer les paiements côté serveur avant d'accorder l'accès premium.
